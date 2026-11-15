@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -723,6 +724,13 @@ def describe_token() -> None:
         "토큰 확인: 길이 %d글자 (정리 전 %d글자), 점 %d개, 앞부분 %s…, .env 안 DISCORD_TOKEN 줄 수 %d",
         len(DISCORD_TOKEN), len(raw), DISCORD_TOKEN.count("."), DISCORD_TOKEN[:6], lines,
     )
+    # 토큰 첫 부분은 봇 번호(공개 정보)를 base64 로 바꾼 것이라, 어느 봇의 토큰인지 알 수 있어요
+    first = DISCORD_TOKEN.split(".")[0]
+    try:
+        bot_id = base64.b64decode(first + "=" * (-len(first) % 4)).decode("ascii")
+    except Exception:
+        bot_id = "알 수 없음"
+    log.info("이 토큰의 봇 번호(애플리케이션 ID): %s", bot_id)
     if lines > 1:
         log.warning(".env 에 DISCORD_TOKEN 이 %d줄 있어요. 한 줄만 남기고 지워 주세요!", lines)
     if DISCORD_TOKEN.count(".") != 2:
