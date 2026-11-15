@@ -22,14 +22,23 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)  # .env 파일 값을 우선으로 써요
 
 
 def env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
-DISCORD_TOKEN = env("DISCORD_TOKEN")
+def clean_token(raw: str) -> str:
+    """휴대폰 복사·붙여넣기로 섞여 들어간 따옴표, 띄어쓰기, 안 보이는 글자를 지워요."""
+    t = raw.strip().strip("'\"")
+    if t.lower().startswith("bot "):
+        t = t[4:]
+    invisible = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00a0"}
+    return "".join(ch for ch in t if not ch.isspace() and ch not in invisible and ch.isprintable())
+
+
+DISCORD_TOKEN = clean_token(os.getenv("DISCORD_TOKEN") or "")
 DISCORD_GUILD_ID = int(env("DISCORD_GUILD_ID", "0"))
 CATEGORY_NAME = env("CATEGORY_NAME", "유튜브 알림")
 PANEL_CHANNEL_NAME = env("PANEL_CHANNEL_NAME", "🔔-알림신청")
@@ -702,10 +711,36 @@ async def on_app_error(interaction: discord.Interaction, error: app_commands.App
         await interaction.response.send_message(msg, ephemeral=True)
 
 
+def describe_token() -> None:
+    """토큰 전체는 숨기고, 문제를 찾는 데 필요한 정보만 보여줘요."""
+    raw = os.getenv("DISCORD_TOKEN") or ""
+    env_path = Path.cwd() / ".env"
+    lines = 0
+    if env_path.exists():
+        lines = sum(1 for ln in env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if ln.strip().startswith("DISCORD_TOKEN"))
+    log.info(
+        "토큰 확인: 길이 %d글자 (정리 전 %d글자), 점 %d개, 앞부분 %s…, .env 안 DISCORD_TOKEN 줄 수 %d",
+        len(DISCORD_TOKEN), len(raw), DISCORD_TOKEN.count("."), DISCORD_TOKEN[:6], lines,
+    )
+    if lines > 1:
+        log.warning(".env 에 DISCORD_TOKEN 이 %d줄 있어요. 한 줄만 남기고 지워 주세요!", lines)
+    if DISCORD_TOKEN.count(".") != 2:
+        log.warning("봇 토큰은 점(.)이 2개 있어야 해요. 다른 값(클라이언트 시크릿 등)을 넣은 건 아닌지 확인해 주세요.")
+
+
 def main():
     if not DISCORD_TOKEN:
         raise SystemExit("DISCORD_TOKEN 환경 변수가 비어 있어요. (README 참고)")
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    describe_token()
+    try:
+        bot.run(DISCORD_TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        log.error(
+            "디스코드가 토큰을 거절했어요. 개발자 사이트의 Bot 메뉴에서 Reset Token 으로 새로 받은 뒤, "
+            ".env 의 DISCORD_TOKEN 값을 바꾸고 다시 켜 주세요. (토큰을 받은 뒤 또 Reset 하면 예전 것은 못 써요)"
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
