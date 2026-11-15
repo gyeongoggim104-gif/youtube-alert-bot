@@ -205,7 +205,7 @@ class NotifyBot(discord.Client):
     @staticmethod
     def _with_defaults(state: dict) -> dict:
         state.setdefault("subs", {})  # {유튜브채널ID: {"name": 이름, "users": [디스코드유저ID...]}}
-        state.setdefault("rooms", {})  # {디스코드유저ID(str): 알림방ID}
+        state.setdefault("rooms", {})  # {디스코드유저ID(str): {"video": 방ID, "live": 방ID}}
         state.setdefault("seen", {})  # {유튜브채널ID: [본 영상ID...]}
         state.setdefault("upcoming", {})  # {영상ID: {"cid", "title", "added"}}
         state.setdefault("panel", {})  # {"channel": ID, "message": ID}
@@ -348,8 +348,16 @@ class NotifyBot(discord.Client):
         return self.guilds[0] if self.guilds else None
 
     async def ensure_category(self, guild: discord.Guild) -> discord.CategoryChannel:
-        cat = discord.utils.get(guild.categories, name=CATEGORY_NAME)
-        return cat or await guild.create_category(CATEGORY_NAME, reason="유튜브 알림 봇")
+        """'유튜브 알림' 카테고리. 디스코드는 카테고리당 방 50개까지라, 꽉 차면 '유튜브 알림 2' 를 만들어요."""
+        n = 1
+        while True:
+            name = CATEGORY_NAME if n == 1 else f"{CATEGORY_NAME} {n}"
+            cat = discord.utils.get(guild.categories, name=name)
+            if cat is None:
+                return await guild.create_category(name, reason="유튜브 알림 봇")
+            if len(cat.channels) < 50:
+                return cat
+            n += 1
 
     async def ensure_panel(self) -> None:
         guild = self.guild()
@@ -380,7 +388,7 @@ class NotifyBot(discord.Client):
             description=(
                 "좋아하는 유튜버의 **새 영상**과 **생방송** 알림을 받아 보세요!\n\n"
                 "1. 아래 **내 알림방 만들기** 버튼을 눌러요.\n"
-                "2. 나만 보이는 알림방이 생겨요.\n"
+                "2. 나만 보이는 알림방 2개(🎬 영상 / 🔴 생방)가 생겨요.\n"
                 "3. 내 방에서 **➕ 유튜버 추가**를 누르고 유튜브 링크를 붙여넣으면 끝!"
             ),
             color=BLUE,
@@ -389,43 +397,69 @@ class NotifyBot(discord.Client):
         self.state["panel"] = {"channel": ch.id, "message": msg.id}
         self.save()
 
-    async def get_room(self, member: discord.Member, create: bool = True) -> discord.TextChannel | None:
-        """그 사람만 보이는 알림방. 없으면 만들어요."""
+    def _room_ids(self, uid: int) -> dict:
+        ids = self.state["rooms"].get(str(uid))
+        if isinstance(ids, int):  # 예전 방식(방 1개)은 영상 방으로 이어서 써요
+            ids = {"video": ids}
+            self.state["rooms"][str(uid)] = ids
+        return ids or {}
+
+    async def get_rooms(self, member: discord.Member) -> dict[str, discord.TextChannel]:
+        """그 사람만 보이는 영상 알림방과 생방 알림방. 없는 방은 만들어요."""
         await self._loaded.wait()
         guild = member.guild
-        room = guild.get_channel(self.state["rooms"].get(str(member.id), 0))
-        if room is not None or not create:
-            return room  # type: ignore[return-value]
-        cat = await self.ensure_category(guild)
-        room = await guild.create_text_channel(
-            f"{ROOM_PREFIX}{member.display_name}"[:90],
-            category=cat,
-            topic=f"{member.display_name} 님의 유튜브 알림방이에요. 다른 사람은 볼 수 없어요.",
-            overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                member: discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True, use_application_commands=True
-                ),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True),
-            },
-            reason=f"{member} 님의 유튜브 알림방",
-        )
-        self.state["rooms"][str(member.id)] = room.id
-        self.save()
-        embed = discord.Embed(
-            title="🎉 내 알림방이 만들어졌어요!",
-            description=(
-                "여기는 **나만 보이는 방**이에요.\n\n"
-                "**➕ 유튜버 추가**: 유튜브 채널 링크를 넣으면 알림을 받아요\n"
-                "**📋 내 목록**: 알림 받는 유튜버 보기\n"
-                "**➖ 삭제**: 알림 그만 받기\n\n"
-                "새 영상은 🎬, 생방송은 🔴 로 알려 드릴게요!"
-            ),
-            color=BLUE,
-        )
-        await room.send(content=member.mention, embed=embed, view=RoomView())
-        log.info("%s 님의 알림방 #%s 을 만들었어요.", member, room.name)
-        return room
+        ids = self._room_ids(member.id)
+        rooms: dict[str, discord.TextChannel] = {}
+        for kind, label in (("video", "영상"), ("live", "생방")):
+            room = guild.get_channel(ids.get(kind, 0))
+            if room is None:
+                room = await guild.create_text_channel(
+                    f"{ROOM_PREFIX}{member.display_name}-{label}"[:90],
+                    category=await self.ensure_category(guild),
+                    topic=f"{member.display_name} 님의 유튜브 {label} 알림방이에요. 다른 멤버는 볼 수 없어요.",
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        member: discord.PermissionOverwrite(
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                            use_application_commands=True,
+                        ),
+                        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True),
+                    },
+                    reason=f"{member} 님의 유튜브 {label} 알림방",
+                )
+                ids[kind] = room.id
+                self.state["rooms"][str(member.id)] = ids
+                self.save()
+                if kind == "video":
+                    desc = "여기는 **나만 보이는 영상 알림방**이에요. 🎬 새 영상과 📼 다시보기 알림이 와요."
+                else:
+                    desc = "여기는 **나만 보이는 생방 알림방**이에요. ⏰ 생방송 예정과 🔴 생방송 시작 알림이 와요."
+                embed = discord.Embed(
+                    title=f"🎉 내 {label} 알림방이 만들어졌어요!",
+                    description=(
+                        f"{desc}\n\n"
+                        "**➕ 유튜버 추가**: 유튜브 채널 링크를 넣으면 알림을 받아요\n"
+                        "**📋 내 목록**: 알림 받는 유튜버 보기\n"
+                        "**➖ 삭제**: 알림 그만 받기"
+                    ),
+                    color=BLUE,
+                )
+                await room.send(content=member.mention, embed=embed, view=RoomView())
+                log.info("%s 님의 %s 알림방 #%s 을 만들었어요.", member, label, room.name)
+            elif not room.name.endswith(label):
+                # 예전 방식(방 1개)에서 넘어온 방은 이름을 '-영상' 으로 맞춰요
+                try:
+                    await room.edit(name=f"{ROOM_PREFIX}{member.display_name}-{label}"[:90])
+                except discord.HTTPException:
+                    log.warning("방 이름을 바꾸지 못했어요: #%s", room.name)
+            rooms[kind] = room  # type: ignore[assignment]
+        return rooms
+
+    @staticmethod
+    def rooms_text(rooms: dict[str, discord.TextChannel]) -> str:
+        return f"🎬 영상: {rooms['video'].mention}\n🔴 생방: {rooms['live'].mention}"
 
     # --- 구독 관리 ---
     def user_channels(self, uid: int) -> list[tuple[str, str]]:
@@ -470,10 +504,10 @@ class NotifyBot(discord.Client):
             return
         async with self._lock:
             added = self.add_sub(member.id, cid, name, videos)
-        room = await self.get_room(member)
+        rooms = await self.get_rooms(member)
         if added:
             await interaction.followup.send(
-                f"✅ **{name}** 추가 완료! 이제 새 영상과 생방송을 {room.mention} 에 알려 드릴게요.", ephemeral=True
+                f"✅ **{name}** 추가 완료! 이제 이렇게 알려 드릴게요.\n{self.rooms_text(rooms)}", ephemeral=True
             )
         else:
             await interaction.followup.send(f"**{name}** 은(는) 이미 추가되어 있어요.", ephemeral=True)
@@ -561,14 +595,15 @@ class NotifyBot(discord.Client):
             desc += f"\n시작 예정: <t:{start}:F> (<t:{start}:R>)"
         embed = discord.Embed(title=title, url=WATCH_URL.format(vid), description=desc, color=color)
         embed.set_image(url=thumbnail(vid))
+        room_kind = "live" if kind in ("live", "upcoming") else "video"
         for uid in list(sub["users"]):
-            await self.deliver(uid, embed)
+            await self.deliver(uid, embed, room_kind)
 
-    async def deliver(self, uid: int, embed: discord.Embed) -> None:
+    async def deliver(self, uid: int, embed: discord.Embed, room_kind: str = "video") -> None:
         guild = self.guild()
         if guild is None:
             return
-        room = guild.get_channel(self.state["rooms"].get(str(uid), 0))
+        room = guild.get_channel(self._room_ids(uid).get(room_kind, 0))
         if room is None:
             try:
                 member = guild.get_member(uid) or await guild.fetch_member(uid)
@@ -578,7 +613,7 @@ class NotifyBot(discord.Client):
                     self.remove_sub(uid, cid)
                 self.state["rooms"].pop(str(uid), None)
                 return
-            room = await self.get_room(member)
+            room = (await self.get_rooms(member))[room_kind]
         try:
             await room.send(content=f"<@{uid}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
         except discord.HTTPException:
@@ -609,8 +644,8 @@ class PanelView(SafeView):
     @discord.ui.button(label="내 알림방 만들기", emoji="🔔", style=discord.ButtonStyle.primary, custom_id="ytn:open_room")
     async def open_room(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        room = await bot.get_room(interaction.user)  # type: ignore[arg-type]
-        await interaction.followup.send(f"👉 내 알림방은 여기예요: {room.mention}", ephemeral=True)
+        rooms = await bot.get_rooms(interaction.user)  # type: ignore[arg-type]
+        await interaction.followup.send(f"👉 내 알림방은 여기예요!\n{bot.rooms_text(rooms)}", ephemeral=True)
 
 
 class AddModal(discord.ui.Modal, title="유튜버 추가"):
@@ -698,8 +733,8 @@ async def remove_cmd(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def room_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    room = await bot.get_room(interaction.user)  # type: ignore[arg-type]
-    await interaction.followup.send(f"👉 내 알림방은 여기예요: {room.mention}", ephemeral=True)
+    rooms = await bot.get_rooms(interaction.user)  # type: ignore[arg-type]
+    await interaction.followup.send(f"👉 내 알림방은 여기예요!\n{bot.rooms_text(rooms)}", ephemeral=True)
 
 
 @bot.tree.error
