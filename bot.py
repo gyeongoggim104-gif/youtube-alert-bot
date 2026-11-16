@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -55,6 +56,11 @@ STATE_FILE = Path(env("STATE_FILE") or _DEFAULT_STATE)
 
 RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
 WATCH_URL = "https://www.youtube.com/watch?v={}"
+# 페이지를 읽을 때는 동의·나이 확인 화면을 건너뛰는 옵션을 붙여요
+WATCH_FETCH_URL = "https://www.youtube.com/watch?v={}&bpctr=9999999999&has_verified=1&hl=ko"
+LIVE_THUMB_URL = "https://i.ytimg.com/vi/{}/hqdefault_live.jpg"
+MAX_AGE_HOURS = int(env("MAX_AGE_HOURS", "48"))  # 이보다 오래된 영상은 새 영상으로 보지 않아요
+SEEN_LIMIT = 300  # 채널마다 기억하는 영상 수
 NS = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -94,7 +100,12 @@ def parse_feed(text: str) -> tuple[str, list[dict]]:
     for entry in root.findall("atom:entry", NS):
         vid = entry.findtext("yt:videoId", namespaces=NS)
         if vid:
-            videos.append({"id": vid, "title": entry.findtext("atom:title", namespaces=NS) or ""})
+            published = entry.findtext("atom:published", namespaces=NS) or ""
+            try:
+                ts = datetime.fromisoformat(published.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts = None
+            videos.append({"id": vid, "title": entry.findtext("atom:title", namespaces=NS) or "", "published": ts})
     return name, videos
 
 
@@ -113,8 +124,11 @@ def extract_channel_id(page: str) -> str | None:
     return None
 
 
-def parse_watch(page: str) -> dict:
-    """영상 페이지 HTML → {"status": live|upcoming|ended|none, "start": 예정 시각(unix)}."""
+def parse_watch(page: str) -> dict | None:
+    """영상 페이지 HTML → {"status": live|upcoming|ended|none, "start": 예정 시각(unix)}.
+    로봇 확인·동의 화면처럼 진짜 영상 페이지가 아니면 None."""
+    if '"videoDetails"' not in page:
+        return None
     if '"isLiveNow":true' in page:
         return {"status": "live", "start": None}
     if '"isUpcoming":true' in page or '"upcomingEventData"' in page:
@@ -163,8 +177,23 @@ class YouTube:
             return None
 
     async def video_status(self, video_id: str) -> dict | None:
-        page = await self.get(WATCH_URL.format(video_id))
-        return parse_watch(page) if page else None
+        page = await self.get(WATCH_FETCH_URL.format(video_id))
+        st = parse_watch(page) if page else None
+        if st is not None:
+            st["how"] = "페이지"
+            return st
+        # 영상 페이지를 못 읽었어요(로봇 확인 등). 생방송·예정 영상에만 있는 썸네일로 확인해요
+        try:
+            async with self.session.get(
+                LIVE_THUMB_URL.format(video_id), headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    return {"status": "livemaybe", "start": None, "how": "썸네일"}
+                if resp.status == 404:
+                    return {"status": "none", "start": None, "how": "썸네일"}
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+        return None
 
     async def resolve(self, text: str) -> tuple[str, str, list[dict]]:
         """링크/핸들 → (채널ID, 채널 이름, 최신 영상). 못 찾으면 ValueError."""
@@ -538,8 +567,15 @@ class NotifyBot(discord.Client):
                     continue
                 seen_set = set(seen)
                 fresh = [v for v in videos if v["id"] not in seen_set]
-                new_videos.extend((cid, v) for v in reversed(fresh))  # 오래된 것부터
-                self.state["seen"][cid] = ([v["id"] for v in videos] + seen)[:50]
+                now = time.time()
+                for v in reversed(fresh):  # 오래된 것부터
+                    if v.get("published") and now - v["published"] > MAX_AGE_HOURS * 3600:
+                        log.info("오래된 영상이라 알림을 건너뛰어요: %s (%s)", v["title"], v["id"])
+                        continue
+                    new_videos.append((cid, v))
+                # 중복 없이, 최신 영상부터 SEEN_LIMIT 개까지 기억해요
+                merged = list(dict.fromkeys([v["id"] for v in videos] + seen))
+                self.state["seen"][cid] = merged[:SEEN_LIMIT]
 
             async def status(vid: str):
                 async with sem:
@@ -550,6 +586,7 @@ class NotifyBot(discord.Client):
             statuses = await asyncio.gather(*(status(v["id"]) for _, v in new_videos))
             for (cid, v), st in zip(new_videos, statuses):
                 kind = st["status"] if st else "unknown"
+                log.info("새 영상: %s (%s) → %s [%s]", v["title"], v["id"], kind, st.get("how") if st else "확인 실패")
                 if kind == "upcoming":
                     self.state["upcoming"][v["id"]] = {"cid": cid, "title": v["title"], "added": time.time()}
                 await self.notify(cid, v["id"], v["title"], kind, st["start"] if st else None)
@@ -577,6 +614,7 @@ class NotifyBot(discord.Client):
             "upcoming": (f"⏰ **{name}** 님의 생방송(또는 최초 공개)이 예정됐어요!", ORANGE),
             "ended": (f"📼 **{name}** 님의 지난 생방송 다시보기가 올라왔어요", GRAY),
             "none": (f"🎬 **{name}** 님의 새 영상이 올라왔어요!", RED),
+            "livemaybe": (f"🔴 **{name}** 님이 생방송을 시작했어요! (또는 예정)", RED),
         }.get(kind, (f"🎬 **{name}** 님의 새 영상(또는 생방송)이 올라왔어요!", RED))
         desc, color = text
         if kind == "upcoming" and start:
